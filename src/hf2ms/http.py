@@ -11,6 +11,10 @@ class TransferError(Exception):
     pass
 
 
+class RetryableTransferError(TransferError):
+    """A response that can be retried without trusting incomplete metadata."""
+
+
 class HTTPError(TransferError):
     def __init__(self, status, retry_after=None, context=None):
         # Do not put signed URLs, tokens, or server-echoed bodies in logs.
@@ -87,7 +91,7 @@ def validate_url(url):
 class HTTP:
     def __init__(self, timeout=120):
         self.session = requests.Session()
-        self.session.headers["User-Agent"] = "hf2ms/0.2.2"
+        self.session.headers["User-Agent"] = "hf2ms/0.2.6"
         self.timeout = (15, timeout)
 
     def close(self):
@@ -177,8 +181,9 @@ class CheckedStream:
     prevents a corrupt source from completing an upload under the expected OID.
     """
 
-    def __init__(self, raw, size, sha256, chunk_size=1024 * 1024):
+    def __init__(self, raw, size, sha256, chunk_size=1024 * 1024, on_read=None):
         self.raw, self.size, self.expected = raw, size, sha256
+        self.on_read = on_read
         self.chunk_size = chunk_size
         self.count = 0
         self.hash = hashlib.sha256()
@@ -204,6 +209,8 @@ class CheckedStream:
             if self._read_raw(1):
                 raise TransferError("Source exceeded its declared size")
             self.verify()
+        if self.on_read is not None:
+            self.on_read(len(data))
         return data
 
     def _read_raw(self, size):

@@ -10,9 +10,10 @@ from typing import Optional, Tuple
 
 import requests
 
-from .http import CheckedStream, HTTPError, TransferError
+from .http import CheckedStream, HTTPError, RetryableTransferError, TransferError
 from .hubs import HuggingFace, ModelScope
 from .state import Cache
+from .progress import Progress
 
 log = logging.getLogger("hf2ms")
 INLINE_LIMIT = 1024 * 1024
@@ -37,10 +38,13 @@ class TransferOptions:
     chunk_size: int = 1024 * 1024
     attempts: int = 3
     timeout: int = 120
+    progress: str = "auto"
     include: Tuple[str, ...] = ()
     exclude: Tuple[str, ...] = ()
 
     def __post_init__(self):
+        if self.progress not in ("auto", "on", "off"):
+            raise ValueError("progress must be auto, on or off")
         if self.repo_type not in ("auto", "model", "dataset"):
             raise ValueError("repo_type must be auto, model or dataset")
         if self.visibility not in ("auto", "private", "public"):
@@ -60,6 +64,7 @@ class Transfer:
         if not ms_token or not ms_token.strip():
             raise ValueError("A non-empty ms_token is required")
         self.options = options
+        self.progress = Progress(options.progress)
         self.source = HuggingFace(
             options.source, options.repo_type, hf_token, options.hf_endpoint, options.timeout
         )
@@ -76,7 +81,7 @@ class Transfer:
         for attempt in range(self.options.attempts):
             try:
                 return operation()
-            except (HTTPError, requests.RequestException) as exc:
+            except (HTTPError, RetryableTransferError, requests.RequestException) as exc:
                 retryable = not isinstance(exc, HTTPError) or exc.status in (
                     408,
                     429,
@@ -93,7 +98,14 @@ class Transfer:
                         delay = min(max(delay, float(exc.retry_after)), 300)
                     except ValueError:
                         pass
-                log.warning("Transient request failure; retrying in %ss", delay)
+                reason = str(exc) if isinstance(exc, TransferError) else "Network request failure"
+                log.warning(
+                    "%s; retrying attempt %s/%s in %ss",
+                    reason,
+                    attempt + 2,
+                    self.options.attempts,
+                    delay,
+                )
                 time.sleep(delay)
 
     def _identity(self):
@@ -210,34 +222,43 @@ class Transfer:
                         license_name = "Other"
                     self._retry(lambda: self.target.create_repo(self._visibility(), license_name))
                     log.info("Created MS repository: %s (%s)", opt.destination, self._visibility())
+                if self.progress.enabled:
+                    self.progress.start(self._retry(lambda: sum(1 for _ in self._selected(commit))))
                 counts = {"committed": 0, "skipped": 0}
                 for file in self._selected(commit):
-                    remote = (
-                        self._retry(lambda file=file: self.target.file(file.path))
-                        if exists
-                        else None
-                    )
-                    decision, sha = self._comparison(file, remote, commit, state)
-                    if decision == "same":
-                        state.mark(file.path, file.size, sha, "committed")
-                        counts["skipped"] += 1
-                        log.info("Skip identical: %s", file.path)
-                    elif decision != "create" and opt.on_conflict == "skip":
-                        counts["skipped"] += 1
-                        log.info("Skip conflict (%s): %s", decision, file.path)
-                    elif decision == "directory":
-                        raise TransferError("Destination is a directory: " + file.path)
-                    elif decision != "create" and opt.on_conflict == "error":
-                        raise TransferError("Destination changed after preflight: " + file.path)
-                    else:
-                        log.info("Transfer (%s): %s (%s bytes)", decision, file.path, file.size)
-                        self._retry(lambda file=file: self._file(file, commit, state))
-                        counts["committed"] += 1
-                    cache.enforce(state.path)
+                    with self.progress.file(file.path, file.size):
+                        remote = (
+                            self._retry(lambda file=file: self.target.file(file.path))
+                            if exists
+                            else None
+                        )
+                        decision, sha = self._comparison(file, remote, commit, state)
+                        if decision == "same":
+                            state.mark(file.path, file.size, sha, "committed")
+                            counts["skipped"] += 1
+                            self.progress.phase("Skipped")
+                            self.progress.info("Skip identical: %s", file.path)
+                        elif decision != "create" and opt.on_conflict == "skip":
+                            counts["skipped"] += 1
+                            self.progress.phase("Skipped conflict")
+                            self.progress.info("Skip conflict (%s): %s", decision, file.path)
+                        elif decision == "directory":
+                            raise TransferError("Destination is a directory: " + file.path)
+                        elif decision != "create" and opt.on_conflict == "error":
+                            raise TransferError("Destination changed after preflight: " + file.path)
+                        else:
+                            self.progress.info(
+                                "Transfer (%s): %s (%s bytes)", decision, file.path, file.size
+                            )
+                            self._retry(lambda file=file: self._file(file, commit, state))
+                            counts["committed"] += 1
+                        cache.enforce(state.path)
+                    self.progress.advance()
                 state.set("complete", True)
                 cache.enforce(state.path)
                 return counts
         finally:
+            self.progress.close()
             self.source.close()
             self.target.close()
 
@@ -281,8 +302,15 @@ class Transfer:
         return report
 
     def _read(self, file, commit, sha256="", collect=False):
+        self.progress.phase("HF read" if collect else "Hashing", reset=True)
         with self.source.open(file, commit) as response:
-            stream = CheckedStream(response.raw, file.size, sha256, self.options.chunk_size)
+            stream = CheckedStream(
+                response.raw,
+                file.size,
+                sha256,
+                self.options.chunk_size,
+                on_read=self.progress.update,
+            )
             chunks = []
             while True:
                 data = stream.read()
@@ -294,6 +322,7 @@ class Transfer:
             return stream.hash.hexdigest(), b"".join(chunks) if collect else None
 
     def _file(self, file, commit, state):
+        self.progress.phase("Preparing", reset=True)
         record = state.file(file.path)
         sha256 = file.sha256 or (record[1] if record else "")
         inline = file.size <= INLINE_LIMIT and not file.sha256
@@ -312,17 +341,26 @@ class Transfer:
             )
         else:
             if not sha256:
-                log.info("No HF SHA-256; streaming hash pass: %s", file.path)
+                self.progress.info("No HF SHA-256; streaming hash pass: %s", file.path)
                 sha256, _ = self._read(file, commit)
                 state.mark(file.path, file.size, sha256, "hashed")
             actions = self.target.negotiate(sha256, file.size)
             if actions is not None:
+                self.progress.phase("HF -> MS", reset=True)
                 with self.source.open(file, commit) as response:
-                    stream = CheckedStream(response.raw, file.size, sha256, self.options.chunk_size)
+                    stream = CheckedStream(
+                        response.raw,
+                        file.size,
+                        sha256,
+                        self.options.chunk_size,
+                        on_read=self.progress.update,
+                    )
                     self.target.upload(actions, stream, sha256, file.size)
             else:
-                log.info("Reuse complete blob: %s", file.path)
+                self.progress.phase("Reused")
+                self.progress.info("Reuse complete blob: %s", file.path)
             state.mark(file.path, file.size, sha256, "uploaded")
             operation.update(type="lfs", sha256=sha256, encoding="", content="")
+        self.progress.phase("Committing")
         self.target.commit(operation)
         state.mark(file.path, file.size, sha256, "committed")

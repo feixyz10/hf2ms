@@ -39,10 +39,10 @@ hf2ms org/source user/destination --ms-token $env:MODELSCOPE_API_TOKEN
 安装 wheel 后可直接使用 console script：
 
 ```bash
-uv tool install ./dist/hf2ms-0.2.2-py3-none-any.whl
+uv tool install ./dist/hf2ms-0.2.6-py3-none-any.whl
 hf2ms --help
 # 或安装到已有 Python 环境：
-pip install ./dist/hf2ms-0.2.2-py3-none-any.whl
+pip install ./dist/hf2ms-0.2.6-py3-none-any.whl
 ```
 
 HTTPS 需要使用 OpenSSL 1.1.1+ 的 Python；macOS/Xcode 旧系统 Python 可能使用 LibreSSL，建议使用 uv 管理的 Python，例如 `uv sync --python 3.11`。
@@ -67,6 +67,7 @@ HTTPS 需要使用 OpenSSL 1.1.1+ 的 Python；macOS/Xcode 旧系统 Python 可�
 | `--dry-run` | 只读预检，输出逐文件计划及 JSON 汇总 |
 | `--chunk-size SIZE` | `1MiB`，控制读取缓冲 |
 | `--attempts N` | `3`，每项操作最大尝试次数 |
+| `--progress auto\|on\|off` | `auto`，终端显示两层进度条，stderr 重定向时自动关闭 |
 | `--timeout SECONDS` | `120`，socket 读取超时 |
 | `--hf-endpoint URL` | `HF_ENDPOINT` 或 `https://huggingface.co` |
 | `--ms-endpoint URL` | `MODELSCOPE_ENDPOINT` 或 `https://modelscope.cn` |
@@ -155,6 +156,16 @@ uv run ruff check .
 uv build
 ```
 
-测试使用本地 HTTP 服务验证实际流式 PUT、断线恢复、自动创建、冲突策略、预览、缓存保护和 token 参数。CI 配置覆盖 Linux/macOS/Windows 与 Python 3.9–3.14。尚未完成真实 HF → ModelScope 带凭据端到端验证，未执行真实 ModelScope 写入。HF 镜像可能将元数据请求重定向到 HF 官方域名，因此运行网络仍需要能连接该域名。
+测试使用本地 HTTP 服务验证实际流式 PUT、断线恢复、自动创建、冲突策略、预览、缓存保护和 token 参数。CI 配置覆盖 Linux/macOS/Windows 与 Python 3.9–3.14。已通过真实带凭据的 dataset 操作验证已有 LFS blob 复用、文件 commit 成功及目标大小/SHA-256 一致。完整仓库及真实流式 PUT 验证仍待完成。HF 镜像可能将元数据请求重定向到 HF 官方域名，因此运行网络仍需要能连接该域名。
 
 协议参考：[ModelScope REST/LFS](https://github.com/modelscope/modelscope_hub/blob/main/src/modelscope_hub/_legacy_api.py)、[HF Hub API](https://huggingface.co/docs/hub/api)。
+
+0.2.3 对 LFS batch 返回的对象缺失、重复或对象列表格式异常也执行有限重试。`--attempts` 默认为 3，包含首次尝试。耗尽后以非零退出码结束并保留进度。直接重跑原命令（无需 `--restart`），已提交且内容相同的文件会跳过，未完成的文件从第 0 字节重传。对象列表字段缺失或格式异常仍会报错；显式空列表的处理见下面的 0.2.5 修正。不会自动跳过失败文件继续其他文件。
+
+0.2.4 修复 dataset 分支列表接口返回 404 导致无法续传的问题：仅对默认 `master`，改用文件列表确认版本可访问，写入权限仍由 commit 接口验证。其他分支仍需分支列表接口正常工作；不会忽略 401/403 或文件列表错误。ModelScope API 报错现在显示原始请求路径，不输出查询参数和签名跳转地址。
+
+0.2.5 修正旧版 ModelScope LFS 的复用语义：显式 `objects: []` 表示无需上传 blob，与官方 SDK 行为一致。随后仍需提交文件引用，只有 commit 成功才记录完成。对象列表字段缺失、格式错误、非空列表中 OID 重复或不匹配仍会报错。
+
+0.2.6 增加两层进度条：`Files` 统计成功提交和跳过的文件数；当前文件显示字节数、速度和预计剩余时间，处理结束后自动消失。哈希读取单独显示，开始上传前归零。`HF -> MS` 统计上传器已读取的字节（不是服务端确认收到的字节），之后显示 `Committing` 直到提交成功。小文件内联上传显示 `HF read` 和 `Committing`；复用已有 blob 不虚增传输字节。重试时当前文件进度归零，失败文件不增加总进度。警告和错误仍保留，但不留下已完成文件的进度条。
+
+可用 `--progress on` 强制显示，或 `--progress off` 使用普通逐文件日志。进度输出到 stderr，dry-run 的 stdout JSON 不变；切换该参数不影响续传。为获得筛选后的精确文件总数而不把全部元数据存入内存，启用进度条时会额外流式遍历一次文件元数据，不落盘缓存文件内容。

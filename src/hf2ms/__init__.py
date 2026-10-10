@@ -3,4 +3,4 @@
 from .transfer import Transfer, TransferOptions
 
 __all__ = ["Transfer", "TransferOptions"]
-__version__ = "0.2.2"
+__version__ = "0.2.6"

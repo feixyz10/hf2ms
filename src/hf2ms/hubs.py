@@ -1,5 +1,6 @@
 """Narrow REST adapters. No Hub SDK download caches or payload temp files."""
 
+import logging
 import re
 from dataclasses import dataclass
 from urllib.parse import quote, urlparse
@@ -7,6 +8,7 @@ from urllib.parse import quote, urlparse
 from .http import (
     HTTP,
     HTTPError,
+    RetryableTransferError,
     TransferError,
     check,
     origin,
@@ -152,14 +154,19 @@ class ModelScope:
 
     def _api(self, method, path, **kwargs):
         headers = {"Authorization": "Bearer " + self.token, "Cookie": "m_session_id=" + self.token}
-        with self.http.api_request(
-            method,
-            self.endpoint + "/api/v1/" + path,
-            headers=headers,
-            allow_redirects=False,
-            **kwargs,
-        ) as response:
-            return payload(response)
+        try:
+            with self.http.api_request(
+                method,
+                self.endpoint + "/api/v1/" + path,
+                headers=headers,
+                allow_redirects=False,
+                **kwargs,
+            ) as response:
+                return payload(response)
+        except HTTPError as exc:
+            # Use the original API route, never a signed redirect/upload URL.
+            context = f"{method} {urlparse(self.endpoint).hostname}/api/v1/{path}"
+            raise HTTPError(exc.status, exc.retry_after, context=context) from exc
 
     def repo_exists(self):
         try:
@@ -191,7 +198,40 @@ class ModelScope:
                 raise
 
     def check_revision(self):
-        result = self._api("GET", f"{self.repo_type}s/{self.repo}/revisions")
+        try:
+            result = self._api("GET", f"{self.repo_type}s/{self.repo}/revisions")
+        except HTTPError as exc:
+            if self.repo_type != "dataset" or exc.status != 404:
+                raise
+            if self.revision != "master":
+                raise TransferError(
+                    "MS dataset revision listing is unavailable (404); cannot confirm "
+                    "a writable custom branch: " + self.revision
+                ) from exc
+            # Some dataset deployments expose the tree but no revision listing.
+            # Only the conventional default branch gets this compatibility path;
+            # a tree read alone cannot distinguish an arbitrary branch from a tag.
+            result = self._api(
+                "GET",
+                f"datasets/{self.repo}/repo/tree",
+                params={
+                    "Revision": "master",
+                    "Root": "/",
+                    "Recursive": "False",
+                    "PageNumber": 1,
+                    "PageSize": 1,
+                },
+            )
+            entries = (
+                result.get("Files", result.get("files")) if isinstance(result, dict) else result
+            )
+            if not isinstance(entries, list):
+                raise TransferError("Cannot confirm MS dataset master from file listing") from exc
+            logging.getLogger("hf2ms").warning(
+                "MS dataset revision listing unavailable (404); "
+                "confirmed master via file listing; write permission will be checked on commit"
+            )
+            return
         if not isinstance(result, dict) or not isinstance(result.get("RevisionMap"), dict):
             raise TransferError("Cannot confirm writable MS branch from revision response")
         branches = result["RevisionMap"].get("Branches") or []
@@ -267,10 +307,20 @@ class ModelScope:
             "repos/{}s/{}/info/lfs/objects/batch".format(self.repo_type, self.repo),
             json={"operation": "upload", "objects": [{"oid": sha256, "size": size}]},
         )
-        objects = result.get("objects", [])
+        objects = result.get("objects") if isinstance(result, dict) else None
+        if not isinstance(objects, list) or any(not isinstance(o, dict) for o in objects):
+            raise RetryableTransferError("LFS batch response has no valid objects list")
+        # The legacy MS API lists blobs needing upload, not every requested OID.
+        # An explicit empty list means reuse (also how the official SDK handles
+        # _validate_blob). The file is only complete after commit succeeds.
+        if not objects:
+            return None
         matches = [o for o in objects if o.get("oid") == sha256]
         if len(matches) != 1:
-            raise TransferError("LFS batch response omitted or duplicated the requested blob")
+            raise RetryableTransferError(
+                f"LFS batch response: {len(objects)} object(s), "
+                f"{len(matches)} matching requested SHA-256 (expected exactly 1)"
+            )
         obj = matches[0]
         if obj.get("error"):
             raise TransferError("ModelScope rejected the LFS blob")

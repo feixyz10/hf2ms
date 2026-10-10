@@ -105,7 +105,18 @@ def build_parser():
         default=1024**2,
         help="Streaming read buffer size (default: 1MiB)",
     )
-    parser.add_argument("--attempts", type=int, default=3)
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=3,
+        help="Maximum attempts per operation, including the first (default: 3)",
+    )
+    parser.add_argument(
+        "--progress",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="File count and byte progress on stderr (default: auto, terminals only)",
+    )
     parser.add_argument("--timeout", type=int, default=120, help="Socket read timeout seconds")
     parser.add_argument(
         "--include", action="extend", nargs="+", default=[], help="Include glob(s); repeatable"
@@ -152,6 +163,7 @@ def main(argv=None):
         return 1
     except (TransferError, ValueError, OSError) as exc:
         log.error("%s", exc)
+        log.info("Progress is saved. Run the same command to resume.")
         return 1
     if result.get("dry_run"):
         print(json.dumps(result, ensure_ascii=False, indent=2))

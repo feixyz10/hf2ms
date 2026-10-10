@@ -39,10 +39,10 @@ hf2ms org/source user/destination --ms-token $env:MODELSCOPE_API_TOKEN
 Install the wheel to use the `hf2ms` console script directly:
 
 ```bash
-uv tool install ./dist/hf2ms-0.2.2-py3-none-any.whl
+uv tool install ./dist/hf2ms-0.2.6-py3-none-any.whl
 hf2ms --help
 # Or install into an existing Python environment:
-pip install ./dist/hf2ms-0.2.2-py3-none-any.whl
+pip install ./dist/hf2ms-0.2.6-py3-none-any.whl
 ```
 
 HTTPS requires a Python build using OpenSSL 1.1.1+. Older macOS/Xcode Python builds may use LibreSSL; a uv-managed Python is recommended, for example `uv sync --python 3.11`.
@@ -67,6 +67,7 @@ HTTPS requires a Python build using OpenSSL 1.1.1+. Older macOS/Xcode Python bui
 | `--dry-run` | Read-only preflight; outputs a per-file plan and a JSON summary |
 | `--chunk-size SIZE` | `1MiB`; streaming read buffer size |
 | `--attempts N` | `3`; maximum attempts per operation |
+| `--progress auto\|on\|off` | `auto`; two progress rows on terminals, disabled for redirected stderr |
 | `--timeout SECONDS` | `120`; socket read timeout |
 | `--hf-endpoint URL` | `HF_ENDPOINT` or `https://huggingface.co` |
 | `--ms-endpoint URL` | `MODELSCOPE_ENDPOINT` or `https://modelscope.cn` |
@@ -155,6 +156,16 @@ uv run ruff check .
 uv build
 ```
 
-Tests use local HTTP servers to exercise actual streaming PUTs, interrupted transfers, repository creation, conflict policies, previews, cache protection, and token arguments. CI is configured for Linux/macOS/Windows and Python 3.9–3.14. Live authenticated HF → ModelScope end-to-end validation is still pending; no real ModelScope writes have been performed. The HF mirror may redirect metadata requests to the official HF host, which must be reachable from your network.
+Tests use local HTTP servers to exercise actual streaming PUTs, interrupted transfers, repository creation, conflict policies, previews, cache protection, and token arguments. CI is configured for Linux/macOS/Windows and Python 3.9–3.14. A live authenticated dataset transfer has verified reuse of an existing LFS blob, a successful file commit, and matching destination size/SHA-256. Full-repository live validation and live streaming PUT validation remain pending. The HF mirror may redirect metadata requests to the official HF host, which must be reachable from your network.
 
 Protocol references: [ModelScope REST/LFS](https://github.com/modelscope/modelscope_hub/blob/main/src/modelscope_hub/_legacy_api.py), [HF Hub API](https://huggingface.co/docs/hub/api).
+
+Version 0.2.3 also retries missing, duplicate, or malformed LFS batch object lists, up to `--attempts` (default: 3, including the first attempt). Exhausted retries stop the run with a nonzero exit code and preserve progress. Run the same command again without `--restart`: identical committed files are skipped; an incomplete file restarts from byte zero. Missing or malformed object-list fields remain errors; see the 0.2.5 correction below for explicit empty lists.
+
+Version 0.2.4 fixes resuming datasets whose revision-list endpoint returns 404. For the default `master` only, hf2ms verifies access using the file-tree endpoint and leaves write authorization to the commit endpoint. Other branches still require a working revision listing; 401/403 and tree errors are not ignored. ModelScope API errors now include the original route without query parameters or signed redirect URLs.
+
+Version 0.2.5 fixes legacy ModelScope LFS reuse: an explicit `objects: []` means no blob upload is needed, matching the official SDK. hf2ms then commits the file reference and records completion only after commit succeeds. Missing/malformed object lists and nonempty lists with duplicate or mismatched OIDs still fail.
+
+Version 0.2.6 adds two progress rows: `Files` counts successfully committed and skipped files; the current file shows bytes, speed, and ETA, then disappears after processing. Hashing is a separate phase that resets before upload. `HF -> MS` counts bytes consumed by the streaming uploader (not server acknowledgements); `Committing` remains until commit succeeds. Small inline files show `HF read` then `Committing`. Reused blobs do not invent transferred bytes. Retries reset the current file, and failed files never advance the file counter. Warnings and errors remain visible without keeping completed file bars.
+
+Use `--progress on` to force display or `--progress off` for ordinary per-file logs. Progress goes to stderr; dry-run JSON on stdout is unchanged. Changing this option does not reset checkpoints. To obtain an exact filtered file total without retaining all metadata, enabled progress performs an extra streaming metadata-list pass; file contents are never cached on disk.

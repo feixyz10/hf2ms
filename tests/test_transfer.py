@@ -95,6 +95,9 @@ def server():
                 self.reply(blob)
             elif self.path.startswith("/api/v1/"):
                 if self.path.endswith("/revisions"):
+                    if data.get("revisions_missing"):
+                        self.reply({}, 404)
+                        return
                     self.reply(
                         {
                             "Data": {
@@ -125,6 +128,19 @@ def server():
             body = json.loads(raw)
             assert self.headers["Authorization"] == "Bearer ms-secret"
             if self.path.endswith("/batch"):
+                data["batches"] = data.get("batches", 0) + 1
+                if data.get("malformed_batch"):
+                    self.reply({"Data": {}})
+                    return
+                if data.get("legacy_reuse") and data["blob"]:
+                    self.reply(
+                        {
+                            "Code": 200,
+                            "Success": True,
+                            "Data": {"objects": [], "reused-objects": []},
+                        }
+                    )
+                    return
                 obj = dict(body["objects"][0])
                 if not data["blob"]:
                     obj["actions"] = {"upload": {"href": base + "/upload"}}
@@ -360,8 +376,97 @@ def test_tokens_not_forwarded_to_storage():
 def test_missing_blob_response_is_not_reuse(monkeypatch):
     target = ModelScope("a/b", "model", "secret")
     try:
-        monkeypatch.setattr(target, "_api", lambda *a, **k: {"objects": []})
+        monkeypatch.setattr(target, "_api", lambda *a, **k: {})
         with pytest.raises(TransferError):
             target.negotiate(SHA, len(BLOB))
     finally:
         target.close()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"objects": None},
+        {"objects": [None]},
+        {"objects": [{"oid": "f" * 64}]},
+        {"objects": [{"oid": SHA}, {"oid": SHA}]},
+    ],
+)
+def test_invalid_batch_is_retryable(response, monkeypatch):
+    from hf2ms.http import RetryableTransferError
+
+    target = ModelScope("owner/repo", "dataset", "secret", "master")
+    monkeypatch.setattr(target, "_api", lambda *args, **kwargs: response)
+    try:
+        with pytest.raises(RetryableTransferError):
+            target.negotiate(SHA, len(BLOB))
+    finally:
+        target.close()
+
+
+def test_malformed_batch_retries_then_succeeds(tmp_path, monkeypatch):
+    with server() as (base, data):
+        opt = options(tmp_path, base)
+        opt.attempts = 3
+        data["malformed_batch"] = True
+        monkeypatch.setattr(
+            "hf2ms.transfer.time.sleep", lambda _: data.update(malformed_batch=False)
+        )
+        result = Transfer(opt, "ms-secret").run()
+        assert result["committed"] == 2
+        assert data["batches"] == 2
+        assert data["puts"] == 1
+
+
+def test_malformed_batch_exhaustion_preserves_resume(tmp_path, monkeypatch):
+    from hf2ms.http import RetryableTransferError
+
+    with server() as (base, data):
+        opt = options(tmp_path, base)
+        opt.attempts = 3
+        data["malformed_batch"] = True
+        monkeypatch.setattr("hf2ms.transfer.time.sleep", lambda _: None)
+        transfer = Transfer(opt, "ms-secret")
+        original_files = transfer.source.files
+        monkeypatch.setattr(
+            transfer.source,
+            "files",
+            lambda commit: iter(sorted(original_files(commit), key=lambda f: f.path)),
+        )
+        with pytest.raises(RetryableTransferError):
+            transfer.run()
+        assert data["batches"] == 3
+        assert data["puts"] == 0
+        assert data["commits"] == 1
+        data["malformed_batch"] = False
+        result = Transfer(opt, "ms-secret").run()
+        assert result == {"committed": 1, "skipped": 1}
+        assert data["commits"] == 2
+        assert data["puts"] == 1
+
+
+@pytest.mark.parametrize("repo_type", ["model", "dataset"])
+def test_legacy_empty_batch_reuses_blob_and_commits(tmp_path, repo_type):
+    with server() as (base, data):
+        data.update(blob=True, legacy_reuse=True)
+        result = Transfer(options(tmp_path, base, repo_type=repo_type), "ms-secret").run()
+        assert result == {"committed": 2, "skipped": 0}
+        assert data["puts"] == 0
+        assert data["reads"] == 1  # README only; LFS content was not downloaded.
+        assert data["remote"]["weights.bin"]["Sha256"] == SHA
+
+
+def test_legacy_reused_blob_failed_commit_resumes(tmp_path):
+    with server() as (base, data):
+        opt = options(tmp_path, base)
+        data.update(blob=True, legacy_reuse=True, fail_commit=True)
+        with pytest.raises(HTTPError):
+            Transfer(opt, "ms-secret").run()
+        assert "weights.bin" not in data["remote"]
+        assert data["reads"] == data["puts"] == 0
+        data["fail_commit"] = False
+        result = Transfer(opt, "ms-secret").run()
+        assert result == {"committed": 2, "skipped": 0}
+        assert data["puts"] == 0
+        assert data["remote"]["weights.bin"]["Sha256"] == SHA
