@@ -1,16 +1,23 @@
 [build-system]
-requires = ["hatchling>=1.25,<2"]
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
 name = "hf2ms"
 version = "0.3.1"
-description = "Bounded-memory Hugging Face to ModelScope streaming transfers"
-readme = "README.md"
+description = "Stream Hugging Face models and datasets to ModelScope with parallel uploads and file-level resume"
+readme = "docs/README.md"
+authors = [{ name = "ExcitingMe" }]
 requires-python = ">=3.9"
 license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["huggingface", "modelscope", "datasets", "models", "streaming", "transfer", "cli"]
 dependencies = ["requests>=2.32.3,<3", "filelock>=3.16,<4", "tqdm>=4.66,<5"]
 classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Topic :: Utilities",
+  "Programming Language :: Python :: 3 :: Only",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
@@ -20,6 +27,11 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
 ]
+
+[project.urls]
+Homepage = "https://github.com/feixyz10/hf2ms/"
+Source = "https://github.com/feixyz10/hf2ms/"
+Issues = "https://github.com/feixyz10/hf2ms/issues"
 
 [project.scripts]
 hf2ms = "hf2ms.cli:main"
@@ -41,3 +53,10 @@ select = ["E4", "E7", "E9", "F", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Keep release metadata compatible with Twine 6 validation.
+[tool.hatch.build.targets.wheel]
+core-metadata-version = "2.4"
+
+[tool.hatch.build.targets.sdist]
+core-metadata-version = "2.4"

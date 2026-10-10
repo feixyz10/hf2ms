@@ -1,6 +1,8 @@
 # hf2ms
 
-[English](README.md) | **简体中文**
+[用户指南（英文）](docs/README.md) | [English](README.md) | **简体中文**
+
+本文保留完整参数、实现细节、恢复语义和开发说明。
 
 将 Hugging Face 模型或数据集流式传输到 ModelScope。大文件内容不落盘，支持多文件并行、文件级恢复、自动创建目标仓库和增量更新。使用 Python 3.9+，提供 Linux/macOS/Windows 通用的纯 Python wheel。
 

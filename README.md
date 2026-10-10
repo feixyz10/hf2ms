@@ -1,6 +1,8 @@
 # hf2ms
 
-**English** | [简体中文](README_CN.md)
+[User guide](docs/README.md) | **English** | [简体中文](README_CN.md)
+
+This document contains the full option reference, implementation details, recovery semantics, and development notes.
 
 Stream Hugging Face models and datasets to ModelScope without saving large file contents to disk. Supports parallel file transfers, file-level recovery, automatic destination repository creation, and incremental updates. Requires Python 3.9+ and provides a pure Python wheel for Linux, macOS, and Windows.
 
