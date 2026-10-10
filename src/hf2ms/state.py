@@ -7,6 +7,7 @@ import time
 import re
 from contextlib import closing, contextmanager
 from pathlib import Path
+from threading import RLock
 
 from filelock import FileLock, Timeout
 
@@ -18,11 +19,14 @@ class State:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = FileLock(str(self.path) + ".lock", timeout=0)
+        self._mutex = RLock()
 
     def __enter__(self):
         self.lock.acquire()
         try:
-            self.db = sqlite3.connect(str(self.path))
+            # One connection, serialized short transactions. No network I/O
+            # runs under this mutex; the file lock still excludes other jobs.
+            self.db = sqlite3.connect(str(self.path), check_same_thread=False)
             self.db.execute("PRAGMA synchronous=FULL")
             self.db.executescript(
                 "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);"
@@ -49,35 +53,39 @@ class State:
         self.set("identity", identity)
 
     def get(self, key):
-        row = self.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        with self._mutex:
+            row = self.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
 
     def set(self, key, value):
-        with self.db:
+        with self._mutex, self.db:
             self.db.execute(
                 "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
                 (key, json.dumps(value, sort_keys=True)),
             )
 
     def file(self, path):
-        return self.db.execute(
-            "SELECT size, sha256, status FROM files WHERE path=?", (path,)
-        ).fetchone()
+        with self._mutex:
+            return self.db.execute(
+                "SELECT size, sha256, status FROM files WHERE path=?", (path,)
+            ).fetchone()
 
     def mark(self, path, size, sha256, status):
-        with self.db:
+        with self._mutex, self.db:
             self.db.execute(
                 "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)", (path, size, sha256, status)
             )
 
     def reset(self, commit):
-        with self.db:
-            self.db.execute("DELETE FROM files")
-            self.db.execute(
-                "INSERT OR REPLACE INTO metadata VALUES ('source_commit', ?)", (json.dumps(commit),)
-            )
-            self.db.execute("INSERT OR REPLACE INTO metadata VALUES ('complete', 'false')")
-        self.db.execute("VACUUM")
+        with self._mutex:
+            with self.db:
+                self.db.execute("DELETE FROM files")
+                self.db.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES ('source_commit', ?)",
+                    (json.dumps(commit),),
+                )
+                self.db.execute("INSERT OR REPLACE INTO metadata VALUES ('complete', 'false')")
+            self.db.execute("VACUUM")
 
 
 class Cache:
@@ -102,6 +110,7 @@ class Cache:
             yield None
             return
         state = object.__new__(State)
+        state._mutex = RLock()
         try:
             state.db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
         except sqlite3.OperationalError:
@@ -134,6 +143,12 @@ class Cache:
     def enforce(self, protected):
         with self._guard():
             self._prune(protected)
+
+    def enforce_state(self, state):
+        # Inspect the current job between transactions, not while a worker's
+        # temporary rollback journal inflates its apparent disk usage.
+        with state._mutex:
+            self.enforce(state.path)
 
     def _prune(self, protected):
         files = [

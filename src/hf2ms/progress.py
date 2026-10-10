@@ -1,8 +1,9 @@
-"""Two transient terminal rows, independent of checkpoint identity and payload storage."""
+"""A file counter and reusable per-thread byte rows; no payload storage."""
 
 import logging
 import sys
 from contextlib import contextmanager
+from threading import RLock, local
 
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
@@ -12,9 +13,18 @@ class Progress:
     def __init__(self, mode="auto"):
         self.enabled = mode == "on" or (mode == "auto" and sys.stderr.isatty())
         self.total = None
-        self.current = None
-        self.path = ""
+        self._local = local()
+        self._rows = {}
+        self._mutex = RLock()
         self._logs = None
+
+    @property
+    def current(self):
+        return getattr(self._local, "bar", None)
+
+    @property
+    def path(self):
+        return getattr(self._local, "path", "")
 
     def start(self, count):
         if not self.enabled:
@@ -34,25 +44,34 @@ class Progress:
     @contextmanager
     def file(self, path, size):
         # Escape control characters in repository-controlled filenames.
-        self.path = "".join(c if c.isprintable() else repr(c)[1:-1] for c in path)
+        self._local.path = "".join(c if c.isprintable() else repr(c)[1:-1] for c in path)
+        position = None
         if self.enabled:
-            self.current = tqdm(
-                total=size,
-                desc=self.path,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                position=1,
-                dynamic_ncols=True,
-                file=sys.stderr,
-                leave=False,
-            )
+            with self._mutex:
+                position = 1
+                while position in self._rows:
+                    position += 1
+                self._local.bar = tqdm(
+                    total=size,
+                    desc=self.path,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    position=position,
+                    dynamic_ncols=True,
+                    file=sys.stderr,
+                    leave=False,
+                )
+                self._rows[position] = self.current
         try:
             yield
         finally:
             if self.current is not None:
-                self.current.close()
-                self.current = None
+                with self._mutex:
+                    self.current.close()
+                    del self._rows[position]
+                    self._local.bar = None
+            self._local.path = ""
 
     def phase(self, label, reset=False):
         if self.current is not None:
@@ -65,17 +84,19 @@ class Progress:
             self.current.update(size)
 
     def advance(self):
-        if self.total is not None:
-            self.total.update(1)
+        with self._mutex:
+            if self.total is not None:
+                self.total.update(1)
 
     def info(self, message, *args):
         if not self.enabled:
             logging.getLogger("hf2ms").info(message, *args)
 
     def close(self):
-        if self.current is not None:
-            self.current.close()
-            self.current = None
+        # Called only after all workers have finished.
+        for bar in self._rows.values():
+            bar.close()
+        self._rows.clear()
         if self.total is not None:
             self.total.close()
             self.total = None

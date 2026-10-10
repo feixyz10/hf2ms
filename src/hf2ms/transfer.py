@@ -3,9 +3,14 @@
 import base64
 import fnmatch
 import logging
+import signal
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, Lock, current_thread, local, main_thread
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import requests
@@ -39,10 +44,13 @@ class TransferOptions:
     attempts: int = 3
     timeout: int = 120
     progress: str = "auto"
+    workers: int = 4
     include: Tuple[str, ...] = ()
     exclude: Tuple[str, ...] = ()
 
     def __post_init__(self):
+        if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
+            raise ValueError("workers must be a positive integer")
         if self.progress not in ("auto", "on", "off"):
             raise ValueError("progress must be auto, on or off")
         if self.repo_type not in ("auto", "model", "dataset"):
@@ -65,6 +73,9 @@ class Transfer:
             raise ValueError("A non-empty ms_token is required")
         self.options = options
         self.progress = Progress(options.progress)
+        self._commit_lock = Lock()
+        self._cancel = Event()
+        self._interrupt = SimpleNamespace(requested=False)
         self.source = HuggingFace(
             options.source, options.repo_type, hf_token, options.hf_endpoint, options.timeout
         )
@@ -77,8 +88,26 @@ class Transfer:
             options.timeout,
         )
 
+    def _check_cancelled(self):
+        if self._cancel.is_set() or self._interrupt.requested:
+            raise TransferError("Transfer interrupted")
+
+    def _backoff(self, delay):
+        deadline = time.monotonic() + delay
+        while True:
+            self._check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._cancel.wait(min(remaining, 0.1))
+
+    def _on_read(self, size):
+        self._check_cancelled()
+        self.progress.update(size)
+
     def _retry(self, operation):
         for attempt in range(self.options.attempts):
+            self._check_cancelled()
             try:
                 return operation()
             except (HTTPError, RetryableTransferError, requests.RequestException) as exc:
@@ -99,14 +128,17 @@ class Transfer:
                     except ValueError:
                         pass
                 reason = str(exc) if isinstance(exc, TransferError) else "Network request failure"
+                path = self.progress.path
+                self.progress.phase(f"Retrying {attempt + 2}/{self.options.attempts}")
                 log.warning(
-                    "%s; retrying attempt %s/%s in %ss",
+                    "%s%s; retrying attempt %s/%s in %ss",
+                    f"{path!r}: " if path else "",
                     reason,
                     attempt + 2,
                     self.options.attempts,
                     delay,
                 )
-                time.sleep(delay)
+                self._backoff(delay)
 
     def _identity(self):
         opt = self.options
@@ -211,7 +243,7 @@ class Transfer:
                         if decision not in ("create", "same"):
                             conflicts += 1
                             log.error("Conflict (%s): %s", decision, file.path)
-                        cache.enforce(state.path)
+                        cache.enforce_state(state)
                     if conflicts:
                         raise TransferError(f"{conflicts} conflict(s); no remote writes performed")
                     self.target._cached_root = None
@@ -224,43 +256,176 @@ class Transfer:
                     log.info("Created MS repository: %s (%s)", opt.destination, self._visibility())
                 if self.progress.enabled:
                     self.progress.start(self._retry(lambda: sum(1 for _ in self._selected(commit))))
-                counts = {"committed": 0, "skipped": 0}
-                for file in self._selected(commit):
-                    with self.progress.file(file.path, file.size):
-                        remote = (
-                            self._retry(lambda file=file: self.target.file(file.path))
-                            if exists
-                            else None
-                        )
-                        decision, sha = self._comparison(file, remote, commit, state)
-                        if decision == "same":
-                            state.mark(file.path, file.size, sha, "committed")
-                            counts["skipped"] += 1
-                            self.progress.phase("Skipped")
-                            self.progress.info("Skip identical: %s", file.path)
-                        elif decision != "create" and opt.on_conflict == "skip":
-                            counts["skipped"] += 1
-                            self.progress.phase("Skipped conflict")
-                            self.progress.info("Skip conflict (%s): %s", decision, file.path)
-                        elif decision == "directory":
-                            raise TransferError("Destination is a directory: " + file.path)
-                        elif decision != "create" and opt.on_conflict == "error":
-                            raise TransferError("Destination changed after preflight: " + file.path)
-                        else:
-                            self.progress.info(
-                                "Transfer (%s): %s (%s bytes)", decision, file.path, file.size
-                            )
-                            self._retry(lambda file=file: self._file(file, commit, state))
-                            counts["committed"] += 1
-                        cache.enforce(state.path)
-                    self.progress.advance()
+                counts = self._run_files(commit, state, cache, exists)
                 state.set("complete", True)
-                cache.enforce(state.path)
+                cache.enforce_state(state)
                 return counts
         finally:
             self.progress.close()
             self.source.close()
             self.target.close()
+
+    def _process_file(self, file, commit, state, exists):
+        with self.progress.file(file.path, file.size):
+            remote = self._retry(lambda: self.target.file(file.path)) if exists else None
+            decision, sha = self._comparison(file, remote, commit, state)
+            outcome = "skipped"
+            if decision == "same":
+                state.mark(file.path, file.size, sha, "committed")
+                self.progress.phase("Skipped")
+                self.progress.info("Skip identical: %s", file.path)
+            elif decision != "create" and self.options.on_conflict == "skip":
+                self.progress.phase("Skipped conflict")
+                self.progress.info("Skip conflict (%s): %s", decision, file.path)
+            elif decision == "directory":
+                raise TransferError("Destination is a directory: " + file.path)
+            elif decision != "create" and self.options.on_conflict == "error":
+                raise TransferError("Destination changed after preflight: " + file.path)
+            else:
+                self.progress.info("Transfer (%s): %s (%s bytes)", decision, file.path, file.size)
+                self._retry(lambda: self._file(file, commit, state))
+                outcome = "committed"
+        self.progress.advance()
+        return outcome
+
+    def _new_worker(self):
+        # Session cookies, authentication, connection pools and directory caches
+        # belong to a single thread. Only progress and the commit mutex are shared.
+        worker = Transfer(self.options, self.target.token, self.source.token)
+        worker.source.repo_type = self.source.repo_type
+        worker.target.repo_type = self.target.repo_type
+        worker.progress = self.progress
+        worker._commit_lock = self._commit_lock
+        worker._cancel = self._cancel
+        worker._interrupt = self._interrupt
+        return worker
+
+    @contextmanager
+    def _worker_pool(self, stopped):
+        pool = ThreadPoolExecutor(max_workers=self.options.workers, thread_name_prefix="hf2ms")
+        previous = None
+
+        def interrupt(_signum, _frame):
+            # Never raise or acquire locks inside a signal handler: SIGINT may
+            # arrive between Thread.start() and executor thread registration.
+            self._interrupt.requested = True
+
+        # Signals run only on the main thread. Preserve application-installed
+        # handlers; the CLI uses Python's default SIGINT handler.
+        if current_thread() is main_thread():
+            handler = signal.getsignal(signal.SIGINT)
+            if handler == signal.default_int_handler:
+                previous = handler
+                signal.signal(signal.SIGINT, interrupt)
+        try:
+            yield pool
+        except KeyboardInterrupt:
+            self._cancel.set()
+            stopped.set()
+            log.warning(
+                "Interrupted; stopping active transfers and waiting for network calls to return"
+            )
+            raise
+        finally:
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            finally:
+                if previous is not None:
+                    signal.signal(signal.SIGINT, previous)
+            if self._interrupt.requested:
+                raise KeyboardInterrupt
+
+    def _run_files(self, commit, state, cache, exists):
+        counts = {"committed": 0, "skipped": 0}
+        files = iter(self._selected(commit))
+        if self.options.workers == 1:
+            for file in files:
+                counts[self._process_file(file, commit, state, exists)] += 1
+                cache.enforce_state(state)
+            return counts
+
+        stopped = Event()
+        thread = local()
+        clients = []
+        clients_lock = Lock()
+
+        def perform(file):
+            # A failure can arrive between submit() and starting the task.
+            if stopped.is_set():
+                return None
+            try:
+                if not hasattr(thread, "worker"):
+                    thread.worker = self._new_worker()
+                    with clients_lock:
+                        clients.append(thread.worker)
+                return thread.worker._process_file(file, commit, state, exists)
+            except BaseException:
+                stopped.set()
+                raise
+
+        failure = None
+        try:
+            with self._worker_pool(stopped) as pool:
+                pending = {}
+                exhausted = False
+                try:
+                    while pending or not exhausted:
+                        if self._interrupt.requested:
+                            raise KeyboardInterrupt
+                        # Keep only N file descriptions/futures in flight; never
+                        # enqueue a whole repository or retain payload buffers.
+                        while (
+                            not exhausted
+                            and not stopped.is_set()
+                            and len(pending) < self.options.workers
+                        ):
+                            file = next(files, None)
+                            if file is None:
+                                exhausted = True
+                                break
+                            if stopped.is_set():
+                                break
+                            pending[pool.submit(perform, file)] = file.path
+                            if self._interrupt.requested:
+                                raise KeyboardInterrupt
+                        if not pending:
+                            break
+                        done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                        if self._interrupt.requested:
+                            raise KeyboardInterrupt
+                        for future in done:
+                            path = pending.pop(future)
+                            try:
+                                outcome = future.result()
+                            except Exception as exc:
+                                stopped.set()
+                                if failure is None:
+                                    failure = exc
+                                    log.warning(
+                                        "File failed (%r); finishing active files before exiting",
+                                        path,
+                                    )
+                                else:
+                                    log.error("Another file failed: %r", path)
+                            else:
+                                if outcome is not None:
+                                    counts[outcome] += 1
+                                    cache.enforce_state(state)
+                        if stopped.is_set():
+                            exhausted = True
+                except BaseException:
+                    stopped.set()
+                    for future in pending:
+                        future.cancel()
+                    # The pool joins active workers before state/session cleanup.
+                    raise
+        finally:
+            for worker in clients:
+                worker.source.close()
+                worker.target.close()
+        if failure is not None:
+            raise failure
+        return counts
 
     def _preview(self, commit, exists, state):
         report = {
@@ -309,7 +474,7 @@ class Transfer:
                 file.size,
                 sha256,
                 self.options.chunk_size,
-                on_read=self.progress.update,
+                on_read=self._on_read,
             )
             chunks = []
             while True:
@@ -353,7 +518,7 @@ class Transfer:
                         file.size,
                         sha256,
                         self.options.chunk_size,
-                        on_read=self.progress.update,
+                        on_read=self._on_read,
                     )
                     self.target.upload(actions, stream, sha256, file.size)
             else:
@@ -361,6 +526,11 @@ class Transfer:
                 self.progress.info("Reuse complete blob: %s", file.path)
             state.mark(file.path, file.size, sha256, "uploaded")
             operation.update(type="lfs", sha256=sha256, encoding="", content="")
-        self.progress.phase("Committing")
-        self.target.commit(operation)
-        state.mark(file.path, file.size, sha256, "committed")
+        self.progress.phase("Waiting to commit")
+        # Serialize branch mutations, not the potentially long data transfers.
+        # Failed attempts release the lock before backoff/re-negotiation.
+        with self._commit_lock:
+            self._check_cancelled()
+            self.progress.phase("Committing")
+            self.target.commit(operation)
+            state.mark(file.path, file.size, sha256, "committed")

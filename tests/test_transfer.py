@@ -205,6 +205,7 @@ def options(tmp_path, base, **kwargs):
         hf_endpoint=base,
         ms_endpoint=base,
         attempts=1,
+        workers=kwargs.pop("workers", 1),
         **kwargs,
     )
 
@@ -224,7 +225,8 @@ def test_actual_http_upload_and_restart(tmp_path, repo_type):
         assert all(p.stat().st_size < 100_000 for p in tmp_path.iterdir())
 
 
-def test_blob_survives_commit_failure(tmp_path):
+@pytest.mark.parametrize("resume_workers", [1, 4])
+def test_blob_survives_commit_failure(tmp_path, resume_workers):
     with server() as (base, data):
         opt = options(tmp_path, base)
         data["fail_commit"] = True
@@ -234,6 +236,7 @@ def test_blob_survives_commit_failure(tmp_path):
         with State(next(tmp_path.glob("*.sqlite3"))) as state:
             assert state.file("weights.bin")[2] == "uploaded"
         data["fail_commit"] = False
+        opt.workers = resume_workers
         Transfer(opt, "ms-secret").run()
         assert data["puts"] == 1
         assert data["reads"] == 2  # weights once, README once
@@ -307,7 +310,9 @@ def test_retry_renegotiates_instead_of_replaying_body(tmp_path, monkeypatch):
         opt = options(tmp_path, base)
         opt.attempts = 2
         data["fail_put"] = True
-        monkeypatch.setattr("hf2ms.transfer.time.sleep", lambda _: data.update(fail_put=False))
+        monkeypatch.setattr(
+            "hf2ms.transfer.Transfer._backoff", lambda self, _: data.update(fail_put=False)
+        )
         Transfer(opt, "ms-secret").run()
         assert data["puts"] == 2
         assert data["reads"] == 3
@@ -411,7 +416,7 @@ def test_malformed_batch_retries_then_succeeds(tmp_path, monkeypatch):
         opt.attempts = 3
         data["malformed_batch"] = True
         monkeypatch.setattr(
-            "hf2ms.transfer.time.sleep", lambda _: data.update(malformed_batch=False)
+            "hf2ms.transfer.Transfer._backoff", lambda self, _: data.update(malformed_batch=False)
         )
         result = Transfer(opt, "ms-secret").run()
         assert result["committed"] == 2
@@ -426,7 +431,7 @@ def test_malformed_batch_exhaustion_preserves_resume(tmp_path, monkeypatch):
         opt = options(tmp_path, base)
         opt.attempts = 3
         data["malformed_batch"] = True
-        monkeypatch.setattr("hf2ms.transfer.time.sleep", lambda _: None)
+        monkeypatch.setattr("hf2ms.transfer.Transfer._backoff", lambda self, _: None)
         transfer = Transfer(opt, "ms-secret")
         original_files = transfer.source.files
         monkeypatch.setattr(

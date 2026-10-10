@@ -112,6 +112,12 @@ def build_parser():
         help="Maximum attempts per operation, including the first (default: 3)",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Concurrent file transfers (default: 4; use 1 for serial transfers)",
+    )
+    parser.add_argument(
         "--progress",
         choices=("auto", "on", "off"),
         default="auto",

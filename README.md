@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README_CN.md)
 
-Stream Hugging Face models and datasets to ModelScope without saving large file contents to disk. Supports file-level recovery, automatic destination repository creation, and incremental updates. Requires Python 3.9+ and provides a pure Python wheel for Linux, macOS, and Windows.
+Stream Hugging Face models and datasets to ModelScope without saving large file contents to disk. Supports parallel file transfers, file-level recovery, automatic destination repository creation, and incremental updates. Requires Python 3.9+ and provides a pure Python wheel for Linux, macOS, and Windows.
 
 ## Installation and quick start
 
@@ -39,10 +39,10 @@ hf2ms org/source user/destination --ms-token $env:MODELSCOPE_API_TOKEN
 Install the wheel to use the `hf2ms` console script directly:
 
 ```bash
-uv tool install ./dist/hf2ms-0.2.6-py3-none-any.whl
+uv tool install ./dist/hf2ms-0.3.1-py3-none-any.whl
 hf2ms --help
 # Or install into an existing Python environment:
-pip install ./dist/hf2ms-0.2.6-py3-none-any.whl
+pip install ./dist/hf2ms-0.3.1-py3-none-any.whl
 ```
 
 HTTPS requires a Python build using OpenSSL 1.1.1+. Older macOS/Xcode Python builds may use LibreSSL; a uv-managed Python is recommended, for example `uv sync --python 3.11`.
@@ -65,9 +65,10 @@ HTTPS requires a Python build using OpenSSL 1.1.1+. Older macOS/Xcode Python bui
 | `--cache-max-size SIZE` | `256MiB`; minimum `64KiB` |
 | `--restart` | Ignore local progress and resolve the source again; identical remote content can still be reused |
 | `--dry-run` | Read-only preflight; outputs a per-file plan and a JSON summary |
-| `--chunk-size SIZE` | `1MiB`; streaming read buffer size |
+| `--chunk-size SIZE` | `1MiB`; streaming read buffer size per active file |
+| `--workers N` | `4`; concurrent file transfers, `1` for serial mode |
 | `--attempts N` | `3`; maximum attempts per operation |
-| `--progress auto\|on\|off` | `auto`; two progress rows on terminals, disabled for redirected stderr |
+| `--progress auto\|on\|off` | `auto`; one file counter and a temporary byte bar per active file; disabled for redirected stderr |
 | `--timeout SECONDS` | `120`; socket read timeout |
 | `--hf-endpoint URL` | `HF_ENDPOINT` or `https://huggingface.co` |
 | `--ms-endpoint URL` | `MODELSCOPE_ENDPOINT` or `https://modelscope.cn` |
@@ -108,7 +109,7 @@ Run **the same command** after an interruption to resume; no `--resume` flag is 
 - An interrupted file is transferred again from the beginning. **Byte-offset recovery within a file is not supported.**
 - `--restart` clears the task's local progress and resolves the source again; it does not force the server to accept identical blob bytes again.
 
-When the cache exceeds its budget, the least recently used **completed, unlocked task databases** are removed first. Running and unfinished tasks are protected. If insufficient space can be reclaimed, checkpoints are preserved and the command fails; increase the budget or manually remove unwanted task state. The budget is checked after checkpoint operations, so the current SQLite transaction and journal can temporarily exceed it; this is not a hard filesystem quota. Cache cleanup never deletes remote content.
+When the cache exceeds its budget, the least recently used **completed, unlocked task databases** are removed first. Running and unfinished tasks are protected. If insufficient space can be reclaimed, checkpoints are preserved and the command fails; increase the budget or manually remove unwanted task state. The budget is checked at file completion and task boundaries, so the current SQLite transaction and journal can temporarily exceed it; this is not a hard filesystem quota. Cache cleanup never deletes remote content.
 
 `--dry-run` does not create cache directories, prune cache, modify checkpoints, create repositories, or call upload negotiation/PUT/commit. With an unfinished checkpoint it previews the pinned source version; `--restart --dry-run` previews the current source version. Files whose equality cannot be established from metadata are marked `unknown`. The JSON `bytes` field is the total selected file size, not guaranteed network traffic. `would_commit`, `would_skip`, and `would_error` count planned file outcomes under the current policy. A successful preview does not prove upload permission.
 
@@ -116,9 +117,26 @@ When the cache exceeds its budget, the least recently used **completed, unlocked
 
 Large files flow from an HF HTTP response into a ModelScope PUT through a bounded read buffer, 1 MiB by default. This buffer is not a server-side multipart chunk. HF LFS SHA-256 metadata avoids a preliminary hashing pass; large files without a hash require a streaming hash pass followed by a streaming upload pass, both without writing contents to disk.
 
-Non-LFS small files (≤1 MiB) are encoded and committed in memory. README.md, .gitattributes, and configuration.json remain regular files and fail if they exceed the inline limit. Memory also includes HTTP/TLS buffers, directory pages, and small-file Base64/JSON, so the read buffer size is not a process RSS limit. Destination metadata caches at most one directory with 3000 entries. ModelScope model directories that cannot be listed completely fail explicitly instead of treating truncated results as missing files.
+Non-LFS small files (≤1 MiB) are encoded and committed in memory. README.md, .gitattributes, and configuration.json remain regular files and fail if they exceed the inline limit. Memory also includes HTTP/TLS buffers, directory pages, and small-file Base64/JSON, so the read buffer size is not a process RSS limit. Each worker caches at most one destination directory with 3000 entries. ModelScope model directories that cannot be listed completely fail explicitly instead of treating truncated results as missing files.
 
 Network failures, HTTP 429, and selected 5xx responses receive bounded retries. Large-file length and SHA-256 are checked during streaming. Serial, per-file commits can encounter rate limits for repositories containing many small files. HF HTTP resolve may restrict very large files; this version does not reconstruct Xet files or fall back to downloading whole files to disk.
+
+## Parallel transfers and progress
+
+```bash
+uv run hf2ms org/source user/destination \
+  --ms-token "$MODELSCOPE_API_TOKEN" --workers 4
+```
+
+`--workers` defaults to **4**. Each thread handles one file at a time using its own HTTP sessions. The scheduler keeps at most that many files in flight instead of queuing the entire repository. Large file contents still flow directly from HF into MS without temporary payload files. Memory for read buffers, HTTP sessions, small inline files, and directory metadata grows with the worker count, not with total payload size. Increasing concurrency helps when latency or individual transfers leave bandwidth unused; it cannot exceed network or service limits.
+
+On a terminal, `Files` tracks successfully committed or skipped files against the exact filtered total. Each active file has its own byte bar with speed, ETA, and phase. Completed file bars disappear and their rows are reused. Hashing and upload are separate phases; retrying a transfer resets that file's byte count. A byte bar reaching 100% means the uploader consumed the bytes, not that MS committed the file: the row remains through `Waiting to commit` and `Committing`. Reused blobs do not invent transferred bytes. `--progress off` uses ordinary logs, `--progress on` forces bars, and `auto` disables bars for redirected stderr. Progress uses stderr; dry-run JSON stays on stdout.
+
+Only branch commits and short SQLite operations are serialized; download/upload streaming holds neither lock. Each file has independent retries. If a file exhausts retries, no further files are scheduled, active transfers finish and save their checkpoints, and the command exits unsuccessfully. Failed files do not advance the total. Ctrl-C requests cancellation at the next stream read, retry wait, or pre-commit check. An already-running network call must return or time out first; a commit already sent can still finish and be checkpointed. Repeated Ctrl-C during shutdown does not close clients or release the checkpoint lock while workers remain active. Commit order can differ from source listing order. Small-file workloads may still be limited by per-file serial commits.
+
+**Existing unfinished serial tasks resume without migration.** Run the same command with `--workers 4`; keep the repository, revisions, filters, conflict policy, endpoints, visibility, and cache directory unchanged. Do not add `--restart`. The SQLite schema and task identity are unchanged: neither `--workers` nor `--progress` participates in the identity. The unfinished task retains its pinned HF commit, and already committed identical remote files are skipped. Switching back to `--workers 1` works the same way. An unfinished file restarts at byte zero.
+
+Threads suit this workload: blocking [I/O releases the GIL](https://docs.python.org/3/c-api/threads.html), and [hashlib releases it for updates larger than 2047 bytes](https://docs.python.org/3/library/hashlib.html). The default buffer is 1 MiB. Processes would add interpreter memory, IPC for progress/checkpoints, and platform-specific startup complexity while still needing serial commits. Hugging Face's [snapshot downloader also exposes concurrent file threads](https://huggingface.co/docs/huggingface_hub/en/package_reference/file_download#huggingface_hub.snapshot_download). hf2ms keeps the same general progress convention while streaming onward to MS.
 
 ## Python API
 
@@ -134,6 +152,7 @@ result = Transfer(
         hf_revision="main",
         ms_revision="master",
         on_conflict="overwrite",
+        workers=4,
     ),
     ms_token=os.environ["MODELSCOPE_API_TOKEN"],
     hf_token=os.getenv("HF_TOKEN"),
@@ -169,3 +188,7 @@ Version 0.2.5 fixes legacy ModelScope LFS reuse: an explicit `objects: []` means
 Version 0.2.6 adds two progress rows: `Files` counts successfully committed and skipped files; the current file shows bytes, speed, and ETA, then disappears after processing. Hashing is a separate phase that resets before upload. `HF -> MS` counts bytes consumed by the streaming uploader (not server acknowledgements); `Committing` remains until commit succeeds. Small inline files show `HF read` then `Committing`. Reused blobs do not invent transferred bytes. Retries reset the current file, and failed files never advance the file counter. Warnings and errors remain visible without keeping completed file bars.
 
 Use `--progress on` to force display or `--progress off` for ordinary per-file logs. Progress goes to stderr; dry-run JSON on stdout is unchanged. Changing this option does not reset checkpoints. To obtain an exact filtered file total without retaining all metadata, enabled progress performs an extra streaming metadata-list pass; file contents are never cached on disk.
+
+Version 0.3.0 adds bounded file-level parallelism (`--workers`, default 4), isolated worker HTTP sessions, serial commits/checkpoint writes, and reusable progress rows per active file. Existing unfinished checkpoints remain compatible.
+
+Version 0.3.1 fixes interruption cleanup and cache-budget checks under concurrency: repeated Ctrl-C cannot close worker resources prematurely, and the current checkpoint is checked between SQLite transactions so a temporary rollback journal cannot cause a false budget failure.

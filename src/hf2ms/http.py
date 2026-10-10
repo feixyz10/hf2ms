@@ -91,7 +91,7 @@ def validate_url(url):
 class HTTP:
     def __init__(self, timeout=120):
         self.session = requests.Session()
-        self.session.headers["User-Agent"] = "hf2ms/0.2.6"
+        self.session.headers["User-Agent"] = "hf2ms/0.3.1"
         self.timeout = (15, timeout)
 
     def close(self):

@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-将 Hugging Face 模型或数据集流式传输到 ModelScope。大文件内容不落盘，支持文件级恢复、自动创建目标仓库和增量更新。使用 Python 3.9+，提供 Linux/macOS/Windows 通用的纯 Python wheel。
+将 Hugging Face 模型或数据集流式传输到 ModelScope。大文件内容不落盘，支持多文件并行、文件级恢复、自动创建目标仓库和增量更新。使用 Python 3.9+，提供 Linux/macOS/Windows 通用的纯 Python wheel。
 
 ## 安装与快速开始
 
@@ -39,10 +39,10 @@ hf2ms org/source user/destination --ms-token $env:MODELSCOPE_API_TOKEN
 安装 wheel 后可直接使用 console script：
 
 ```bash
-uv tool install ./dist/hf2ms-0.2.6-py3-none-any.whl
+uv tool install ./dist/hf2ms-0.3.1-py3-none-any.whl
 hf2ms --help
 # 或安装到已有 Python 环境：
-pip install ./dist/hf2ms-0.2.6-py3-none-any.whl
+pip install ./dist/hf2ms-0.3.1-py3-none-any.whl
 ```
 
 HTTPS 需要使用 OpenSSL 1.1.1+ 的 Python；macOS/Xcode 旧系统 Python 可能使用 LibreSSL，建议使用 uv 管理的 Python，例如 `uv sync --python 3.11`。
@@ -65,9 +65,10 @@ HTTPS 需要使用 OpenSSL 1.1.1+ 的 Python；macOS/Xcode 旧系统 Python 可�
 | `--cache-max-size SIZE` | `256MiB`，最小 `64KiB` |
 | `--restart` | 忽略本地进度、重新解析源版本；仍复用远端相同内容 |
 | `--dry-run` | 只读预检，输出逐文件计划及 JSON 汇总 |
-| `--chunk-size SIZE` | `1MiB`，控制读取缓冲 |
+| `--chunk-size SIZE` | `1MiB`，每个活跃文件的读取缓冲 |
+| `--workers N` | `4`，并行传输的文件数；`1` 为串行模式 |
 | `--attempts N` | `3`，每项操作最大尝试次数 |
-| `--progress auto\|on\|off` | `auto`，终端显示两层进度条，stderr 重定向时自动关闭 |
+| `--progress auto\|on\|off` | `auto`，总文件数进度条及每个活跃文件的临时字节进度条；stderr 重定向时自动关闭 |
 | `--timeout SECONDS` | `120`，socket 读取超时 |
 | `--hf-endpoint URL` | `HF_ENDPOINT` 或 `https://huggingface.co` |
 | `--ms-endpoint URL` | `MODELSCOPE_ENDPOINT` 或 `https://modelscope.cn` |
@@ -108,7 +109,7 @@ HTTPS 需要使用 OpenSSL 1.1.1+ 的 Python；macOS/Xcode 旧系统 Python 可�
 - 文件上传中断：该文件从头传，**不支持文件内部字节偏移续传**。
 - `--restart` 清除当前任务本地进度并重新解析源版本；不意味着强迫服务器再次接收相同 blob。
 
-缓存超限会按最久未使用顺序删除**已完成且未被占用的任务数据库**。正在运行和未完成的任务不会被自动清除。若无法释放足够空间则保留检查点并报错，需增大额度或手动删除不再需要的任务状态。额度是检查点操作后的预算检查，SQLite 当前事务及 journal 可能暂时超过预算；不是硬磁盘配额。缓存清理不会删除远端内容。
+缓存超限会按最久未使用顺序删除**已完成且未被占用的任务数据库**。正在运行和未完成的任务不会被自动清除。若无法释放足够空间则保留检查点并报错，需增大额度或手动删除不再需要的任务状态。额度在文件完成和任务边界检查，SQLite 当前事务及 journal 可能暂时超过预算；不是硬磁盘配额。缓存清理不会删除远端内容。
 
 `--dry-run` 不创建缓存目录、不清理缓存、不修改检查点，不创建远端仓库、不调用上传协商/PUT/commit。已有未完成检查点时预览其固定版本；`--restart --dry-run` 预览当前源版本。无法仅从元数据确认相同时标记 `unknown`。JSON 的 `bytes` 是选中文件总大小，不是必然产生的网络流量；`would_commit`/`would_skip`/`would_error` 表示按当前策略计划执行的文件数，预览成功不等于真实上传权限已验证。
 
@@ -116,9 +117,26 @@ HTTPS 需要使用 OpenSSL 1.1.1+ 的 Python；macOS/Xcode 旧系统 Python 可�
 
 大文件通过默认 1 MiB 有界缓冲从 HF HTTP 响应送入 ModelScope PUT。此缓冲不是服务端 multipart 分片。HF 提供 LFS SHA-256 时无需先读取计算；无哈希的大文件先流式哈希、再流式上传，两遍读取但均不落盘。
 
-非 LFS 小文件（≤1 MiB）在内存内编码提交；README.md、.gitattributes、configuration.json 保持普通文件，超过上限时失败。内存还包括 HTTP/TLS 缓冲、目录页和小文件 Base64/JSON，因此缓冲大小不等于进程 RSS。目标目录元数据最多缓存一个目录的 3000 项；无法完整列举的 MS 模型目录会明确失败，不把截断结果误认作文件不存在。
+非 LFS 小文件（≤1 MiB）在内存内编码提交；README.md、.gitattributes、configuration.json 保持普通文件，超过上限时失败。内存还包括 HTTP/TLS 缓冲、目录页和小文件 Base64/JSON，因此缓冲大小不等于进程 RSS。每个工作线程的目标目录元数据最多缓存一个目录的 3000 项；无法完整列举的 MS 模型目录会明确失败，不把截断结果误认作文件不存在。
 
 网络错误和 429/部分 5xx 有有限次重试。大文件大小、SHA-256 在流式传输时校验。串行、每文件一次 commit 的方式可能受碎文件上传限流影响。HF 超大文件 HTTP resolve 可能受限，本版不实现 Xet 重建，也不回退到完整落盘下载。
+
+## 并行上传与进度条
+
+```bash
+uv run hf2ms org/source user/destination \
+  --ms-token "$MODELSCOPE_API_TOKEN" --workers 4
+```
+
+`--workers` 默认 **4**。每个线程同时处理一个文件，使用独立的 HTTP 会话。调度器最多保留 N 个进行中的文件，不会一次排队整个仓库。大文件仍然直接从 HF 流向 MS，不创建文件内容缓存；读取缓冲、HTTP 会话、小文件内联编码和目录元数据的内存占用随并发数增长，不随总文件内容大小增长。并行能利用单文件传输未占满的带宽，但不能突破网络或服务端限制。
+
+终端中的 `Files` 显示成功提交或跳过的文件数，以及筛选后的准确总数。每个活跃文件都有独立的字节进度条，显示速度、预计剩余时间和阶段。文件处理完成后，该条消失，空出的行可供下一个文件使用。哈希读取与上传分阶段显示，重新传输时只重置该文件的字节数。字节条到达 100% 表示上传器已读取全部字节，不代表 MS 已提交文件；随后仍显示 `Waiting to commit` / `Committing`。复用已有 blob 不虚增传输字节。`--progress off` 使用普通日志，`on` 强制显示进度条，默认 `auto` 在 stderr 重定向时自动关闭。进度写入 stderr，dry-run 的 stdout JSON 不变。
+
+只有仓库 commit 和短暂的 SQLite 操作需要串行，下载/上传过程中不持有这两个锁。每个文件独立重试。某个文件重试耗尽后，停止调度新文件，已开始的其他文件完成并保存进度，最后以失败退出码结束。失败文件不增加总进度。Ctrl-C 会请求取消，线程在下一次流读取、重试等待或 commit 前检查时停止；已经进行中的网络调用需要先返回或超时，已发出的 commit 仍可能成功并写入检查点。关闭过程中再次按 Ctrl-C，不会在线程仍活跃时提前关闭会话或释放任务锁。并行时 commit 顺序可能与源文件列表不同，碎文件的速度仍可能受逐文件串行 commit 限制。
+
+**此前未完成的串行任务可以直接续传，无需迁移。** 在原命令后加 `--workers 4` 即可；仓库、revision、筛选条件、冲突策略、endpoint、可见性和缓存目录保持原值，不要加 `--restart`。SQLite 表结构和任务标识保持兼容，`--workers` 与 `--progress` 都不参与缓存标识。未完成任务继续使用原来固定的 HF commit，已提交且远端内容相同的文件会跳过。以后切回 `--workers 1` 也可以续传；未传完的单个文件仍从第 0 字节重传。
+
+选择多线程是因为：[阻塞 I/O 会释放 GIL](https://docs.python.org/3/c-api/threads.html)，[hashlib 每次处理超过 2047 字节也会释放 GIL](https://docs.python.org/3/library/hashlib.html)，默认读取缓冲为 1 MiB。多进程会增加解释器内存、进度和状态的跨进程通信及跨平台启动复杂度，且仍需要串行 commit。HF 的 [snapshot downloader 也支持文件级线程并行](https://huggingface.co/docs/huggingface_hub/en/package_reference/file_download#huggingface_hub.snapshot_download)。本工具沿用类似的进度展示方式，同时将数据继续流式转发到 MS。
 
 ## Python API
 
@@ -134,6 +152,7 @@ result = Transfer(
         hf_revision="main",
         ms_revision="master",
         on_conflict="overwrite",
+        workers=4,
     ),
     ms_token=os.environ["MODELSCOPE_API_TOKEN"],
     hf_token=os.getenv("HF_TOKEN"),
@@ -169,3 +188,7 @@ uv build
 0.2.6 增加两层进度条：`Files` 统计成功提交和跳过的文件数；当前文件显示字节数、速度和预计剩余时间，处理结束后自动消失。哈希读取单独显示，开始上传前归零。`HF -> MS` 统计上传器已读取的字节（不是服务端确认收到的字节），之后显示 `Committing` 直到提交成功。小文件内联上传显示 `HF read` 和 `Committing`；复用已有 blob 不虚增传输字节。重试时当前文件进度归零，失败文件不增加总进度。警告和错误仍保留，但不留下已完成文件的进度条。
 
 可用 `--progress on` 强制显示，或 `--progress off` 使用普通逐文件日志。进度输出到 stderr，dry-run 的 stdout JSON 不变；切换该参数不影响续传。为获得筛选后的精确文件总数而不把全部元数据存入内存，启用进度条时会额外流式遍历一次文件元数据，不落盘缓存文件内容。
+
+0.3.0 增加有界的文件级并行（`--workers` 默认 4）、线程独立 HTTP 会话、串行 commit/状态写入及可复用的多文件进度条。已有未完成任务的 checkpoint 保持兼容。
+
+0.3.1 修复并发中断清理和缓存预算检查：连续按 Ctrl-C 不再提前关闭线程资源；当前任务的预算检查在 SQLite 事务之间进行，避免临时 rollback journal 引起误超限。

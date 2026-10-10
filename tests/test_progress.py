@@ -66,7 +66,9 @@ def test_commit_failure_does_not_advance_total(tmp_path, bars):
 def test_retry_resets_bytes_without_double_counting(tmp_path, bars, monkeypatch):
     with server() as (base, data):
         data["fail_commit"] = True
-        monkeypatch.setattr("hf2ms.transfer.time.sleep", lambda _: data.update(fail_commit=False))
+        monkeypatch.setattr(
+            "hf2ms.transfer.Transfer._backoff", lambda self, _: data.update(fail_commit=False)
+        )
         opt = options(tmp_path, base, progress="on")
         opt.attempts = 2
         Transfer(opt, "ms-secret").run()
@@ -122,3 +124,78 @@ def test_progress_choice_does_not_change_checkpoint_identity(tmp_path):
         first.target.close()
         other.source.close()
         other.target.close()
+
+
+def test_concurrent_rows_are_independent_and_reused(bars):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    progress = Progress("on")
+    progress.start(4)
+    barrier = threading.Barrier(3, timeout=10)
+
+    def show(index):
+        with progress.file(f"file-{index}", 100 + index):
+            progress.phase("HF -> MS", reset=True)
+            barrier.wait()
+            progress.update(100 + index)
+        progress.advance()
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(show, range(3)))
+        assert sorted(abs(bar.pos) for bar in bars[1:]) == [1, 2, 3]
+        assert all(bar.n == bar.total for bar in bars[1:])
+        assert all(bar.disable and not bar.requested_leave for bar in bars[1:])
+        assert progress._rows == {}
+        with progress.file("next-file", 20):
+            progress.update(20)
+        progress.advance()
+        assert abs(bars[-1].pos) == 1
+        assert bars[0].n == bars[0].total == 4
+    finally:
+        progress.close()
+    assert all(bar.disable for bar in bars)
+
+
+def test_parallel_transfer_progress_and_cleanup(tmp_path, bars):
+    import threading
+    from test_parallel import parallel_server
+
+    with parallel_server(count=5) as (base, data):
+        barrier = threading.Barrier(3, timeout=10)
+        data["put_hook"] = lambda name: barrier.wait() if int(name[5:-4]) < 3 else None
+        opt = options(tmp_path, base, workers=3, progress="on")
+        Transfer(opt, "ms-secret").run()
+        assert bars[0].n == bars[0].total == 5
+        assert len(bars) == 6
+        assert sorted(abs(bar.pos) for bar in bars[1:4]) == [1, 2, 3]
+        assert all(1 <= abs(bar.pos) <= 3 for bar in bars[1:])
+        assert all(bar.n == bar.total for bar in bars[1:])
+        assert all(bar.disable for bar in bars)
+        assert all(any("Committing" in p for p in bar.phases) for bar in bars[1:])
+        assert all(not bar.requested_leave for bar in bars[1:])
+
+
+def test_parallel_retry_resets_only_its_own_bar(tmp_path, bars, monkeypatch):
+    import threading
+    from test_parallel import parallel_server
+
+    with parallel_server(count=3) as (base, data):
+        barrier = threading.Barrier(3, timeout=10)
+        data["put_hook"] = lambda name: barrier.wait() if data["puts"][name] == 1 else None
+        data["fail_put_once"].add("part-0.bin")
+        monkeypatch.setattr("hf2ms.transfer.Transfer._backoff", lambda self, _: None)
+        opt = options(tmp_path, base, workers=3, progress="on")
+        opt.attempts = 2
+        assert Transfer(opt, "ms-secret").run() == {"committed": 3, "skipped": 0}
+        assert data["puts"] == {"part-0.bin": 2, "part-1.bin": 1, "part-2.bin": 1}
+        assert bars[0].n == 3
+        for bar in bars[1:]:
+            assert bar.n == bar.total
+            if bar.desc.startswith("part-0.bin"):
+                assert bar.total in bar.before_reset
+                assert any("Retrying 2/2" in p for p in bar.phases)
+            else:
+                assert all(n == 0 for n in bar.before_reset)
+        assert all(bar.disable for bar in bars)
